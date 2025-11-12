@@ -13,14 +13,24 @@ type pterm =
   | IfZero of pterm * pterm * pterm
   | IfEmpty of pterm * pterm * pterm
   | Fix of pterm
-  | Let of string * pterm * pterm 
+  | Let of string * pterm * pterm
+  (* Imperative features *)
+  | Unit
+  | Ref of pterm
+  | Deref of pterm
+  | Assign of pterm * pterm
+  | Loc of int  (* memory location/address *)
 (* Types *) 
 type ptype = 
   | TVar of string 
+  | PolyFaible of string  (* Variable de type faible '_a pour polymorphisme faible *)
   | Arr of ptype * ptype 
   | Nat
   | List of ptype
-  | Forall of string list * ptype 
+  | Forall of string list * ptype
+  (* Imperative types *)
+  | TUnit
+  | TRef of ptype 
 (* Environnements de typage *) 
 type env = (string * ptype) list 
 (* Listes d'équations *) 
@@ -42,16 +52,26 @@ let rec print_term (t : pterm) : string =
     | IfEmpty (c, t1, t2) -> "(ifempty " ^ (print_term c) ^ " then " ^ (print_term t1) ^ " else " ^ (print_term t2) ^ ")"
     | Fix u -> "(fix " ^ (print_term u) ^ ")"
     | Let (x, e1, e2) -> "(let " ^ x ^ " = " ^ (print_term e1) ^ " in " ^ (print_term e2) ^ ")"
+    (* Imperative features *)
+    | Unit -> "()"
+    | Ref e -> "(ref " ^ (print_term e) ^ ")"
+    | Deref e -> "(!" ^ (print_term e) ^ ")"
+    | Assign (e1, e2) -> "(" ^ (print_term e1) ^ " := " ^ (print_term e2) ^ ")"
+    | Loc r -> "loc" ^ (string_of_int r)
 (* pretty printer de types*)                    
 let rec print_type (t : ptype) : string =
   match t with
     TVar x -> x
+  | PolyFaible x -> "'" ^ x  (* Variables de type faibles avec ' *)
   | Arr (t1, t2) -> "(" ^ (print_type t1) ^" -> "^ (print_type t2) ^")"
   | Nat -> "Nat"
   | List t1 -> "[" ^ (print_type t1) ^ "]"
   | Forall (vs, t) ->
       let vs_s = String.concat " " vs in
-      "forall " ^ vs_s ^ ". " ^ (print_type t) 
+      "forall " ^ vs_s ^ ". " ^ (print_type t)
+  (* Imperative types *)
+  | TUnit -> "Unit"
+  | TRef t1 -> "(Ref " ^ (print_type t1) ^ ")" 
 
 (* générateur de noms frais de variables de types *)
 let compteur_var : int ref = ref 0                    
@@ -74,6 +94,7 @@ let rec cherche_type (v : string) (e : env) : ptype =
 let rec appartient_type (v : string) (t : ptype) : bool =
   match t with
     TVar v1 when v1 = v -> true
+  | PolyFaible v1 when v1 = v -> true
   | Arr (t1, t2) -> (appartient_type v t1) || (appartient_type v t2) 
   | _ -> false
 
@@ -82,14 +103,32 @@ let rec substitue_type (t : ptype) (v : string) (t0 : ptype) : ptype =
   match t with
     TVar v1 when v1 = v -> t0
   | TVar v2 -> TVar v2
+  | PolyFaible v1 when v1 = v -> t0
+  | PolyFaible v2 -> PolyFaible v2
   | Arr (t1, t2) -> Arr (substitue_type t1 v t0, substitue_type t2 v t0) 
   | Nat -> Nat
   | List u -> List (substitue_type u v t0)
-  | Forall (vs, u) -> if List.mem v vs then Forall (vs, u) else Forall (vs, substitue_type u v t0) 
+  | Forall (vs, u) -> if List.mem v vs then Forall (vs, u) else Forall (vs, substitue_type u v t0)
+  (* Imperative types *)
+  | TUnit -> TUnit
+  | TRef u -> TRef (substitue_type u v t0) 
 
 (* remplace une variable par un type dans une liste d'équations*)
 let substitue_type_partout (e : equa) (v : string) (t0 : ptype) : equa =
   List.map (fun (x, y) -> (substitue_type x v t0, substitue_type y v t0)) e
+
+(* Determine si une expression est non-expansive (valeur) pour le polymorphisme faible *)
+let rec is_non_expansive (te : pterm) : bool =
+  match te with
+  | Var _ -> true
+  | Abs _ -> true
+  | N _ -> true
+  | Nil -> true
+  | Unit -> true
+  | Cons (e1, e2) -> is_non_expansive e1 && is_non_expansive e2
+  (* Toutes les autres expressions sont expansives *)
+  | App _ | Add _ | Sub _ | IfZero _ | Hd _ | Tl _ | IfEmpty _ 
+  | Fix _ | Let _ | Ref _ | Deref _ | Assign _ | Loc _ -> false
 
 (* genere des equations de typage à partir d'un terme *)  
 let rec genere_equa (te : pterm) (ty : ptype) (e : env) : equa =
@@ -143,11 +182,29 @@ let rec genere_equa (te : pterm) (ty : ptype) (e : env) : equa =
       | _ -> raise (TypingError "Fix attend une abstraction (Abs)")
     )
   | Let (x, e1, e2) ->
-      (* Pour simplifier, on type e1 avec une variable fraîche, puis e2 *)
-      let a = TVar (nouvelle_var ()) in
+      (* Polymorphisme faible : utilise PolyFaible si e1 est expansive *)
+      let a = if is_non_expansive e1 then TVar (nouvelle_var ()) else PolyFaible (nouvelle_var ()) in
       let eqs1 = genere_equa e1 a e in
       let eqs2 = genere_equa e2 ty ((x, a) :: e) in
       eqs1 @ eqs2
+  (* Imperative features *)
+  | Unit -> [(ty, TUnit)]
+  | Loc _ -> 
+      let a = TVar (nouvelle_var ()) in
+      [(ty, TRef a)]
+  | Ref t ->
+      let a = TVar (nouvelle_var ()) in
+      let eqst = genere_equa t a e in
+      (ty, TRef a) :: eqst
+  | Deref t ->
+      let a = TVar (nouvelle_var ()) in
+      let eqst = genere_equa t (TRef a) e in
+      (ty, a) :: eqst
+  | Assign (t1, t2) ->
+      let a = TVar (nouvelle_var ()) in
+      let eqs1 = genere_equa t1 (TRef a) e in
+      let eqs2 = genere_equa t2 a e in
+      (ty, TUnit) :: (eqs1 @ eqs2)
       
 exception Echec_unif of string      
 
@@ -186,6 +243,12 @@ let rec unification (e : equa_zip) (but : string) : ptype =
   | (e1, (TVar v1, t2)::e2) ->  if appartient_type v1 t2 then raise (Echec_unif ("occurence de "^ v1 ^" dans "^(print_type t2))) else  unification (substitue_type_zip (rembobine (e1,e2)) v1 t2) but
     (* une variable à droite : vérification d'occurence puis remplacement *)
   | (e1, (t1, TVar v2)::e2) ->  if appartient_type v2 t1 then raise (Echec_unif ("occurence de "^ v2 ^" dans " ^(print_type t1))) else  unification (substitue_type_zip (rembobine (e1,e2)) v2 t1) but 
+    (* PolyFaible : deux variables faibles *)
+  | (e1, (PolyFaible v1, PolyFaible v2)::e2) -> unification (substitue_type_zip (rembobine (e1,e2)) v2 (PolyFaible v1)) but
+    (* PolyFaible à gauche : vérification d'occurence puis remplacement *)
+  | (e1, (PolyFaible v1, t2)::e2) ->  if appartient_type v1 t2 then raise (Echec_unif ("occurence de "^ v1 ^" dans "^(print_type t2))) else  unification (substitue_type_zip (rembobine (e1,e2)) v1 t2) but
+    (* PolyFaible à droite : vérification d'occurence puis remplacement *)
+  | (e1, (t1, PolyFaible v2)::e2) ->  if appartient_type v2 t1 then raise (Echec_unif ("occurence de "^ v2 ^" dans " ^(print_type t1))) else  unification (substitue_type_zip (rembobine (e1,e2)) v2 t1) but
     (* types fleche des deux cotes : on decompose  *)
   | (e1, (Arr (t1,t2), Arr (t3, t4))::e2) -> unification (e1, (t1, t3)::(t2, t4)::e2) but 
     (* types fleche à gauche pas à droite : echec  *)
@@ -209,7 +272,19 @@ let rec unification (e : equa_zip) (but : string) : ptype =
     (* types Forall à gauche pas à droite : échec *)
   | (e1, (Forall _, t3)::e2) -> raise (Echec_unif ("type forall non-unifiable avec "^(print_type t3)))
     (* types Forall à droite pas à gauche : échec *)
-  | (e1, (t3, Forall _)::e2) -> raise (Echec_unif ("type forall non-unifiable avec "^(print_type t3)))     
+  | (e1, (t3, Forall _)::e2) -> raise (Echec_unif ("type forall non-unifiable avec "^(print_type t3)))
+    (* types Unit des deux cotes : on passe *)
+  | (e1, (TUnit, TUnit)::e2) -> unification (e1, e2) but
+    (* types Unit à gauche pas à droite : échec *)
+  | (e1, (TUnit, t3)::e2) -> raise (Echec_unif ("type unit non-unifiable avec "^(print_type t3)))
+    (* types Unit à droite pas à gauche : échec *)
+  | (e1, (t3, TUnit)::e2) -> raise (Echec_unif ("type unit non-unifiable avec "^(print_type t3)))
+    (* types Ref des deux cotes : on decompose *)
+  | (e1, (TRef t1, TRef t2)::e2) -> unification (e1, (t1, t2)::e2) but
+    (* types Ref à gauche pas à droite : échec *)
+  | (e1, (TRef _, t3)::e2) -> raise (Echec_unif ("type ref non-unifiable avec "^(print_type t3)))
+    (* types Ref à droite pas à gauche : échec *)
+  | (e1, (t3, TRef _)::e2) -> raise (Echec_unif ("type ref non-unifiable avec "^(print_type t3)))     
                                        
 (* enchaine generation d'equation et unification *)                                   
 let inference (t : pterm) : string =
@@ -292,6 +367,62 @@ let inf_ex_length : string = inference ex_length
 let ex_length_test : pterm = App (ex_length, ex_list2)
 let inf_ex_length_test : string = inference ex_length_test
 
+(* Imperative features examples *)
+let ex_unit : pterm = Unit
+let inf_ex_unit : string = inference ex_unit
+
+let ex_ref1 : pterm = Ref (N 42)
+let inf_ex_ref1 : string = inference ex_ref1
+
+let ex_deref1 : pterm = Let ("r", Ref (N 10), Deref (Var "r"))
+let inf_ex_deref1 : string = inference ex_deref1
+
+let ex_assign1 : pterm = Let ("r", Ref (N 5), 
+                              Let ("_", Assign (Var "r", N 10),
+                                  Deref (Var "r")))
+let inf_ex_assign1 : string = inference ex_assign1
+
+let ex_ref_list : pterm = Let ("r", Ref Nil,
+                               Let ("_", Assign (Var "r", Cons (N 1, Nil)),
+                                   Deref (Var "r")))
+let inf_ex_ref_list : string = inference ex_ref_list
+
+(* Counter example *)
+let ex_counter : pterm = Let ("r", Ref (N 0),
+                              Let ("incr", Abs ("_", 
+                                              Let ("v", Deref (Var "r"),
+                                                   Let ("_", Assign (Var "r", Add (Var "v", N 1)),
+                                                       Unit))),
+                                  Let ("_", App (Var "incr", Unit),
+                                      Let ("_", App (Var "incr", Unit),
+                                          Deref (Var "r")))))
+let inf_ex_counter : string = inference ex_counter
+
+(* =================== POLYMORPHISME FAIBLE TESTS =================== *)
+
+(* Example 1: OK - [] est une valeur, donc polymorphe *)
+let ex_poly_faible_ok : pterm = 
+  Let ("l", Nil,
+       Let ("l1", Cons (N 1, Var "l"),
+            Let ("l2", Cons (Abs ("x", Var "x"), Var "l"),
+                 Unit)))
+
+let poly_faible_test_ok : string = inference ex_poly_faible_ok
+
+(* Example 2: BAD - ref [] est expansif, donc type faible '_a list ref
+   Ce programme devrait être rejeté car on tente d'utiliser l avec deux types incompatibles *)
+let ex_poly_faible_bad : pterm =
+  Let ("l", Ref Nil,
+       Let ("_", Assign (Var "l", Cons (Abs ("x", Var "x"), Nil)),
+            Add (Hd (Deref (Var "l")), N 2)))
+
+let poly_faible_test_bad : string = 
+  try
+    inference ex_poly_faible_bad
+  with
+  | Echec_unif msg -> "Echec d'unification (attendu pour polymorphisme faible): " ^ msg
+  | TypingError msg -> "Erreur de typage: " ^ msg
+
 (* =================== EVALUATION (call-by-value, capture-avoiding) =================== *)
 
 (* generator for fresh term variables *)
@@ -315,6 +446,12 @@ let rec free_vars t =
   | IfEmpty (c, t1, t2) -> List.concat [free_vars c; free_vars t1; free_vars t2]
   | Fix u -> free_vars u
   | Let (x, e1, e2) -> List.concat [free_vars e1; List.filter (fun y -> y <> x) (free_vars e2)]
+  (* Imperative features *)
+  | Unit -> []
+  | Loc _ -> []
+  | Ref t -> free_vars t
+  | Deref t -> free_vars t
+  | Assign (t1, t2) -> List.concat [free_vars t1; free_vars t2]
 
 (* rename free occurrences of 'oldv' into 'newv' except when shadowed *)
 let rec rename_bound t oldv newv =
@@ -337,6 +474,12 @@ let rec rename_bound t oldv newv =
   | Let (x, e1, e2) ->
       if x = oldv then Let (x, rename_bound e1 oldv newv, e2)
       else Let (x, rename_bound e1 oldv newv, rename_bound e2 oldv newv)
+  (* Imperative features *)
+  | Unit -> Unit
+  | Loc r -> Loc r
+  | Ref t -> Ref (rename_bound t oldv newv)
+  | Deref t -> Deref (rename_bound t oldv newv)
+  | Assign (t1, t2) -> Assign (rename_bound t1 oldv newv, rename_bound t2 oldv newv)
 
 (* capture-avoiding substitution [t[v := s]] *)
 let rec subst t v s =
@@ -370,6 +513,12 @@ let rec subst t v s =
           let e2' = rename_bound e2 y y' in
           Let (y', e1', subst e2' v s)
         else Let (y, e1', subst e2 v s)
+  (* Imperative features *)
+  | Unit -> Unit
+  | Loc r -> Loc r
+  | Ref t -> Ref (subst t v s)
+  | Deref t -> Deref (subst t v s)
+  | Assign (t1, t2) -> Assign (subst t1 v s, subst t2 v s)
 
 (* predicate: value *)
 let rec is_value t =
@@ -377,87 +526,136 @@ let rec is_value t =
   | Abs _ | N _ -> true
   | Nil -> true
   | Cons (vh, vt) when is_value vh && is_value vt -> true
+  (* Imperative values *)
+  | Unit -> true
+  | Loc _ -> true
   | _ -> false
 
 exception EvalStuck of string
 exception Divergence of string
 
-(* one-step call-by-value *)
-let rec eval1 t =
+(* State for imperative features: maps region IDs to values *)
+type state = (int * pterm) list
+
+(* region counter for fresh region allocation *)
+let compteur_region : int ref = ref 0
+let nouvelle_region () : int = compteur_region := !compteur_region + 1; !compteur_region
+
+(* lookup a region in the state *)
+let rec lookup_state (s : state) (r : int) : pterm option =
+  match s with
+  | [] -> None
+  | (r', v) :: rest -> if r = r' then Some v else lookup_state rest r
+
+(* update a region in the state *)
+let rec update_state (s : state) (r : int) (v : pterm) : state =
+  match s with
+  | [] -> [(r, v)]
+  | (r', v') :: rest -> if r = r' then (r, v) :: rest else (r', v') :: update_state rest r v
+
+(* one-step call-by-value with state *)
+let rec eval1_with_state (t : pterm) (s : state) : (pterm * state) option =
   match t with
-    App (Abs (x, body), v2) when is_value v2 -> Some (subst body x v2)
+    App (Abs (x, body), v2) when is_value v2 -> Some (subst body x v2, s)
   | App (v1, t2) when is_value v1 ->
-      (match eval1 t2 with None -> None | Some t2' -> Some (App (v1, t2')))
+      (match eval1_with_state t2 s with None -> None | Some (t2', s') -> Some (App (v1, t2'), s'))
   | App (t1, t2) ->
-      (match eval1 t1 with None -> None | Some t1' -> Some (App (t1', t2)))
-  | Add (N n1, N n2) -> Some (N (n1 + n2))
+      (match eval1_with_state t1 s with None -> None | Some (t1', s') -> Some (App (t1', t2), s'))
+  | Add (N n1, N n2) -> Some (N (n1 + n2), s)
   | Add (N n1, t2) ->
-      (match eval1 t2 with None -> None | Some t2' -> Some (Add (N n1, t2')))
+      (match eval1_with_state t2 s with None -> None | Some (t2', s') -> Some (Add (N n1, t2'), s'))
   | Add (t1, t2) ->
-      (match eval1 t1 with None -> None | Some t1' -> Some (Add (t1', t2)))
-  | Sub (N n1, N n2) -> Some (N (n1 - n2))
+      (match eval1_with_state t1 s with None -> None | Some (t1', s') -> Some (Add (t1', t2), s'))
+  | Sub (N n1, N n2) -> Some (N (n1 - n2), s)
   | Sub (N n1, t2) ->
-      (match eval1 t2 with None -> None | Some t2' -> Some (Sub (N n1, t2')))
+      (match eval1_with_state t2 s with None -> None | Some (t2', s') -> Some (Sub (N n1, t2'), s'))
   | Sub (t1, t2) ->
-      (match eval1 t1 with None -> None | Some t1' -> Some (Sub (t1', t2)))
+      (match eval1_with_state t1 s with None -> None | Some (t1', s') -> Some (Sub (t1', t2), s'))
   | Cons (h, tl) ->
       if is_value h then
-        (match eval1 tl with None -> None | Some tl' -> Some (Cons (h, tl')))
+        (match eval1_with_state tl s with None -> None | Some (tl', s') -> Some (Cons (h, tl'), s'))
       else
-        (match eval1 h with None -> None | Some h' -> Some (Cons (h', tl)))
+        (match eval1_with_state h s with None -> None | Some (h', s') -> Some (Cons (h', tl), s'))
   | Hd u ->
-      (match eval1 u with
-      | Some u' -> Some (Hd u')
+      (match eval1_with_state u s with
+      | Some (u', s') -> Some (Hd u', s')
       | None ->
           match u with
-          | Cons (vh, vt) when is_value vh && is_value vt -> Some vh
+          | Cons (vh, vt) when is_value vh && is_value vt -> Some (vh, s)
           | _ -> None)
   | Tl u ->
-      (match eval1 u with
-      | Some u' -> Some (Tl u')
+      (match eval1_with_state u s with
+      | Some (u', s') -> Some (Tl u', s')
       | None ->
           match u with
-          | Cons (vh, vt) when is_value vh && is_value vt -> Some vt
+          | Cons (vh, vt) when is_value vh && is_value vt -> Some (vt, s)
           | _ -> None)
   | IfZero (c, t1, t2) ->
-      (match eval1 c with
-      | Some c' -> Some (IfZero (c', t1, t2))
+      (match eval1_with_state c s with
+      | Some (c', s') -> Some (IfZero (c', t1, t2), s')
       | None ->
           match c with
-          | N 0 -> Some t1
-          | N _ -> Some t2
+          | N 0 -> Some (t1, s)
+          | N _ -> Some (t2, s)
           | _ -> None)
   | IfEmpty (c, t1, t2) ->
-      (match eval1 c with
-      | Some c' -> Some (IfEmpty (c', t1, t2))
+      (match eval1_with_state c s with
+      | Some (c', s') -> Some (IfEmpty (c', t1, t2), s')
       | None ->
           match c with
-          | Nil -> Some t1
-          | Cons (vh, vt) when is_value vh && is_value vt -> Some t2
+          | Nil -> Some (t1, s)
+          | Cons (vh, vt) when is_value vh && is_value vt -> Some (t2, s)
           | _ -> None)
   | Fix u ->
       (match u with
-      | Abs (phi, m) -> Some (subst m phi (Fix u))
+      | Abs (phi, m) -> Some (subst m phi (Fix u), s)
       | _ ->
-          match eval1 u with
-          | Some u' -> Some (Fix u')
+          match eval1_with_state u s with
+          | Some (u', s') -> Some (Fix u', s')
           | None -> None)
   | Let (x, e1, e2) ->
-      if is_value e1 then Some (subst e2 x e1)
+      if is_value e1 then Some (subst e2 x e1, s)
       else
-        (match eval1 e1 with
-        | Some e1' -> Some (Let (x, e1', e2))
+        (match eval1_with_state e1 s with
+        | Some (e1', s') -> Some (Let (x, e1', e2), s')
         | None -> None)
+  (* Imperative features *)
+  | Deref (Loc r) ->
+      (match lookup_state s r with
+      | Some v -> Some (v, s)
+      | None -> None)
+  | Deref t ->
+      (match eval1_with_state t s with
+      | Some (t', s') -> Some (Deref t', s')
+      | None -> None)
+  | Ref v when is_value v ->
+      let r = nouvelle_region () in
+      Some (Loc r, (r, v) :: s)
+  | Ref t ->
+      (match eval1_with_state t s with
+      | Some (t', s') -> Some (Ref t', s')
+      | None -> None)
+  | Assign (Loc r, v) when is_value v ->
+      let s' = update_state s r v in
+      Some (Unit, s')
+  | Assign (Loc r, t2) ->
+      (match eval1_with_state t2 s with
+      | Some (t2', s') -> Some (Assign (Loc r, t2'), s')
+      | None -> None)
+  | Assign (t1, t2) ->
+      (match eval1_with_state t1 s with
+      | Some (t1', s') -> Some (Assign (t1', t2), s')
+      | None -> None)
   | _ -> None
 
 (* full evaluation with step limit to avoid non-termination *)
 let eval ?(max_steps=10000) t =
-  let rec loop t steps =
-    if steps > max_steps then raise (Divergence ("***PAS TYPABLE*** : exceeded " ^ string_of_int max_steps ^ " steps"))
-    else match eval1 t with
+  let rec loop t s steps =
+    if steps > max_steps then raise (Divergence ("exceeded " ^ string_of_int max_steps ^ " steps"))
+    else match eval1_with_state t s with
       | None -> t
-      | Some t' -> loop t' (steps + 1)
-  in loop t 0
+      | Some (t', s') -> loop t' s' (steps + 1)
+  in loop t [] 0
 
 (* helpers to safely try evaluation and pretty print result *)
 let eval_to_string ?(max_steps=10000) t =
@@ -521,6 +719,18 @@ let main () =
  print_endline "======================";
  print_endline inf_ex_length_test;
  print_endline "======================";
+ print_endline inf_ex_unit;
+ print_endline "======================";
+ print_endline inf_ex_ref1;
+ print_endline "======================";
+ print_endline inf_ex_deref1;
+ print_endline "======================";
+ print_endline inf_ex_assign1;
+ print_endline "======================";
+ print_endline inf_ex_ref_list;
+ print_endline "======================";
+ print_endline inf_ex_counter;
+ print_endline "======================";
  (* Evaluation prints *)
  print_endline "=== EVALUATION ===";
  print_endline (eval_to_string ex_id);
@@ -544,6 +754,16 @@ let main () =
  print_endline (eval_to_string ex_let1);
  print_endline (eval_to_string ex_let2);
  print_endline (eval_to_string ~max_steps:100 ex_fact_3);
- print_endline (eval_to_string ~max_steps:100 ex_length_test)
+ print_endline (eval_to_string ~max_steps:100 ex_length_test);
+ print_endline "=== IMPERATIVE EVALUATION ===";
+ print_endline (eval_to_string ex_unit);
+ print_endline (eval_to_string ex_ref1);
+ print_endline (eval_to_string ex_deref1);
+ print_endline (eval_to_string ex_assign1);
+ print_endline (eval_to_string ex_ref_list);
+ print_endline (eval_to_string ex_counter);
+ print_endline "=== POLYMORPHISME FAIBLE TESTS ===";
+ print_endline poly_faible_test_ok;
+ print_endline poly_faible_test_bad
 
 let _ = main ()
